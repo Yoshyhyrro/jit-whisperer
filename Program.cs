@@ -152,7 +152,15 @@ namespace AffineSpace.Optimization
             var database = client.GetDatabase(databaseName);
             _collection  = database.GetCollection<AffineDocument>(collectionName);
 
-            EnsureIndexes();
+            try
+            {
+                EnsureIndexes();
+            }
+            catch (TimeoutException ex)
+            {
+                throw new InvalidOperationException(
+                    $"MongoDB に接続できませんでした ({connectionString})。サーバーが起動しているか確認してください。", ex);
+            }
             _root = new BStarQuiverNode();
         }
 
@@ -165,7 +173,7 @@ namespace AffineSpace.Optimization
         private void EnsureIndexes()
         {
             var keys    = Builders<AffineDocument>.IndexKeys.Ascending(d => d.MortonCode);
-            var options = new CreateIndexOptions { Background = true, Name = "ix_morton" };
+            var options = new CreateIndexOptions { Name = "ix_morton" };
             _collection.Indexes.CreateOne(new CreateIndexModel<AffineDocument>(keys, options));
         }
 
@@ -295,8 +303,11 @@ namespace AffineSpace.Optimization
     {
         private static void Main()
         {
+            var connStr = Environment.GetEnvironmentVariable("MONGODB_CONNECTION")
+                          ?? "mongodb://localhost:27017";
+
             using var engine = new MongoDBPruningEngine(
-                connectionString: "mongodb://localhost:27017",
+                connectionString: connStr,
                 databaseName:     "affine_db",
                 collectionName:   "points");
 
