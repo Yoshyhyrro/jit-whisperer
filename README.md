@@ -20,6 +20,13 @@ The code in this repository is intentionally close to the metal.
 
 ## Requirements
 
-- .NET 8+
+- .NET 5 SDK 以上
 - MongoDB 6+ (local or Atlas)
-- `MongoDB.Driver` NuGet package
+
+## Build
+
+```bash
+dotnet build
+```
+
+The repository now includes a project file, so building from the repository root works directly.
