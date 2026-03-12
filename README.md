@@ -20,7 +20,7 @@ The code in this repository is intentionally close to the metal.
 
 ## Requirements
 
-- .NET 8 SDK upper
+- .NET 5 SDK 以上
 - MongoDB 6+ (local or Atlas)
 
 ## Build
