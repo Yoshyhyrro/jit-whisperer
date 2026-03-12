@@ -1,0 +1,17 @@
+services:
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+
+  app:
+    build: .
+    depends_on:
+      - mongo
+    environment:
+      - MONGODB_CONNECTION=mongodb://mongo:27017
+
+volumes:
+  mongo-data:
