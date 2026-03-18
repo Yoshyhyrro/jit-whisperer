@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -34,6 +35,274 @@ namespace AffineSpace.Optimization
 
         public Vector<float> Low  => _low;
         public Vector<float> High => _high;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public float GetCoordinate(int dimension)
+        {
+            if ((uint)dimension >= 11u)
+                throw new ArgumentOutOfRangeException(nameof(dimension));
+
+            return dimension < 8 ? _low[dimension] : _high[dimension - 8];
+        }
+
+        public float AverageCoordinate()
+        {
+            float sum = 0f;
+            for (int dimension = 0; dimension < 11; dimension++)
+                sum += GetCoordinate(dimension);
+
+            return sum / 11f;
+        }
+
+        public static AffinePoint11 ComponentwiseMin(in AffinePoint11 left, in AffinePoint11 right)
+        {
+            var coords = new float[11];
+            for (int dimension = 0; dimension < 11; dimension++)
+                coords[dimension] = Math.Min(left.GetCoordinate(dimension), right.GetCoordinate(dimension));
+
+            return new AffinePoint11(coords);
+        }
+
+        public static AffinePoint11 ComponentwiseMax(in AffinePoint11 left, in AffinePoint11 right)
+        {
+            var coords = new float[11];
+            for (int dimension = 0; dimension < 11; dimension++)
+                coords[dimension] = Math.Max(left.GetCoordinate(dimension), right.GetCoordinate(dimension));
+
+            return new AffinePoint11(coords);
+        }
+    }
+
+    /// <summary>
+    /// Five height bands induced by the Golay route w0 → w8 → w12 → w16 → w24.
+    /// The tree uses them as a finite routing alphabet for monotone path search.
+    /// </summary>
+    public enum GolayHeightBand
+    {
+        W0 = 0,
+        W8 = 1,
+        W12 = 2,
+        W16 = 3,
+        W24 = 4
+    }
+
+    /// <summary>
+    /// Geometric modalities borrowed from the BSD/Fischer/Harada-Norton layer.
+    /// They are used as a lightweight search heuristic rather than a hard constraint.
+    /// </summary>
+    public enum SearchModality
+    {
+        Affine,
+        Hybrid,
+        Banach
+    }
+
+    public enum RouteDirection
+    {
+        Ascending,
+        Descending
+    }
+
+    public static class QuiverRouteTheory
+    {
+        private static readonly GolayHeightBand[] OrderedBands =
+        {
+            GolayHeightBand.W0,
+            GolayHeightBand.W8,
+            GolayHeightBand.W12,
+            GolayHeightBand.W16,
+            GolayHeightBand.W24
+        };
+
+        public static IReadOnlyList<GolayHeightBand> Bands => OrderedBands;
+
+        public static int Rank(GolayHeightBand band) => (int)band;
+
+        public static GolayHeightBand Complement(GolayHeightBand band)
+        {
+            return band switch
+            {
+                GolayHeightBand.W0 => GolayHeightBand.W24,
+                GolayHeightBand.W8 => GolayHeightBand.W16,
+                GolayHeightBand.W12 => GolayHeightBand.W12,
+                GolayHeightBand.W16 => GolayHeightBand.W8,
+                _ => GolayHeightBand.W0
+            };
+        }
+
+        public static SearchModality ToModality(GolayHeightBand band)
+        {
+            return band switch
+            {
+                GolayHeightBand.W0 or GolayHeightBand.W24 => SearchModality.Affine,
+                GolayHeightBand.W12 => SearchModality.Hybrid,
+                _ => SearchModality.Banach
+            };
+        }
+
+        public static int Distance(GolayHeightBand left, GolayHeightBand right)
+            => Math.Abs(Rank(left) - Rank(right));
+
+        public static GolayHeightBand Classify(in AffinePoint11 point)
+        {
+            float normalized = Math.Clamp(point.AverageCoordinate() / 31f, 0f, 1f);
+
+            if (normalized < 0.10f) return GolayHeightBand.W0;
+            if (normalized < 0.28f) return GolayHeightBand.W8;
+            if (normalized < 0.45f) return GolayHeightBand.W12;
+            if (normalized < 0.72f) return GolayHeightBand.W16;
+            return GolayHeightBand.W24;
+        }
+
+        public static SearchModality ClassifyQuerySpan(in AffinePoint11 qMin, in AffinePoint11 qMax)
+        {
+            float span = 0f;
+            for (int dimension = 0; dimension < 11; dimension++)
+                span += Math.Abs(qMax.GetCoordinate(dimension) - qMin.GetCoordinate(dimension));
+
+            float averageSpan = span / 11f;
+            if (averageSpan <= 2f) return SearchModality.Affine;
+            if (averageSpan <= 8f) return SearchModality.Hybrid;
+            return SearchModality.Banach;
+        }
+
+        public static bool IsInvalidInterval(in AffinePoint11 min, in AffinePoint11 max)
+        {
+            for (int dimension = 0; dimension < 11; dimension++)
+            {
+                if (min.GetCoordinate(dimension) > max.GetCoordinate(dimension))
+                    return true;
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Dynamic-programming state for quiver-guided tree traversal.
+    /// Mirrors the Lean-side DP/path discipline: monotone routes, weighted transitions,
+    /// and a complement bonus around the self-dual midpoint.
+    /// </summary>
+    public readonly struct SearchRouteState
+    {
+        public SearchRouteState(
+            GolayHeightBand? lastBand,
+            int pathLength,
+            float accumulatedWeight,
+            GolayHeightBand queryMinBand,
+            GolayHeightBand queryMaxBand,
+            RouteDirection direction,
+            SearchModality preferredModality)
+        {
+            LastBand = lastBand;
+            PathLength = pathLength;
+            AccumulatedWeight = accumulatedWeight;
+            QueryMinBand = queryMinBand;
+            QueryMaxBand = queryMaxBand;
+            Direction = direction;
+            PreferredModality = preferredModality;
+        }
+
+        public GolayHeightBand? LastBand { get; }
+        public int PathLength { get; }
+        public float AccumulatedWeight { get; }
+        public GolayHeightBand QueryMinBand { get; }
+        public GolayHeightBand QueryMaxBand { get; }
+        public RouteDirection Direction { get; }
+        public SearchModality PreferredModality { get; }
+
+        public static SearchRouteState FromQuery(in AffinePoint11 qMin, in AffinePoint11 qMax)
+        {
+            var minBand = QuiverRouteTheory.Classify(qMin);
+            var maxBand = QuiverRouteTheory.Classify(qMax);
+            var direction = QuiverRouteTheory.Rank(minBand) <= QuiverRouteTheory.Rank(maxBand)
+                ? RouteDirection.Ascending
+                : RouteDirection.Descending;
+
+            return new SearchRouteState(
+                lastBand: null,
+                pathLength: 0,
+                accumulatedWeight: 1f,
+                queryMinBand: minBand,
+                queryMaxBand: maxBand,
+                direction: direction,
+                preferredModality: QuiverRouteTheory.ClassifyQuerySpan(qMin, qMax));
+        }
+
+        public bool CanAdvance(BStarQuiverNode node)
+        {
+            if (!node.HeightBand.HasValue || !node.HasBounds)
+                return true;
+
+            int nextRank = QuiverRouteTheory.Rank(node.HeightBand.Value);
+            int lowerRank = Math.Min(QuiverRouteTheory.Rank(QueryMinBand), QuiverRouteTheory.Rank(QueryMaxBand));
+            int upperRank = Math.Max(QuiverRouteTheory.Rank(QueryMinBand), QuiverRouteTheory.Rank(QueryMaxBand));
+
+            if (PathLength > 0 && (nextRank < lowerRank - 1 || nextRank > upperRank + 1))
+                return false;
+
+            if (!LastBand.HasValue)
+                return true;
+
+            int lastRank = QuiverRouteTheory.Rank(LastBand.Value);
+            return Direction switch
+            {
+                RouteDirection.Ascending => nextRank >= lastRank,
+                _ => nextRank <= lastRank
+            };
+        }
+
+        public SearchRouteState Advance(BStarQuiverNode node)
+        {
+            if (!node.HeightBand.HasValue)
+                return this;
+
+            float nextWeight = AccumulatedWeight + 1f;
+            if (node.Modality == PreferredModality)
+                nextWeight += 0.5f;
+
+            int distanceToWindow = Math.Min(
+                QuiverRouteTheory.Distance(node.HeightBand.Value, QueryMinBand),
+                QuiverRouteTheory.Distance(node.HeightBand.Value, QueryMaxBand));
+            nextWeight += 1f / (1 + distanceToWindow);
+
+            if (LastBand.HasValue && QuiverRouteTheory.Complement(LastBand.Value) == node.HeightBand.Value)
+                nextWeight += 0.25f;
+
+            return new SearchRouteState(
+                lastBand: node.HeightBand.Value,
+                pathLength: PathLength + 1,
+                accumulatedWeight: nextWeight,
+                queryMinBand: QueryMinBand,
+                queryMaxBand: QueryMaxBand,
+                direction: Direction,
+                preferredModality: PreferredModality);
+        }
+
+        public float GetPriority(BStarQuiverNode node)
+        {
+            if (!node.HeightBand.HasValue)
+                return PathLength;
+
+            int distanceToWindow = Math.Min(
+                QuiverRouteTheory.Distance(node.HeightBand.Value, QueryMinBand),
+                QuiverRouteTheory.Distance(node.HeightBand.Value, QueryMaxBand));
+            float modalityPenalty = node.Modality == PreferredModality ? 0f : 0.5f;
+
+            return PathLength + distanceToWindow + modalityPenalty - (AccumulatedWeight * 0.1f);
+        }
+    }
+
+    public readonly struct TraversalFrame
+    {
+        public TraversalFrame(BStarQuiverNode node, SearchRouteState route)
+        {
+            Node = node;
+            Route = route;
+        }
+
+        public BStarQuiverNode Node { get; }
+        public SearchRouteState Route { get; }
     }
 
     /// <summary>
@@ -73,6 +342,20 @@ namespace AffineSpace.Optimization
         /// </summary>
         public BStarQuiverNode Sibling { get; set; }
 
+        public BStarQuiverNode(GolayHeightBand? heightBand = null)
+        {
+            HeightBand = heightBand;
+            Modality = heightBand.HasValue
+                ? QuiverRouteTheory.ToModality(heightBand.Value)
+                : SearchModality.Hybrid;
+        }
+
+        public GolayHeightBand? HeightBand { get; }
+
+        public SearchModality Modality { get; }
+
+        public bool HasBounds { get; private set; }
+
         /// <summary>Minimum bounding point of the hyper-rectangular region covered by this node (BRIN lower bound).</summary>
         public AffinePoint11 MinBound;
 
@@ -81,6 +364,20 @@ namespace AffineSpace.Optimization
 
         public List<AffinePoint11>   Entries  = new List<AffinePoint11>();
         public List<BStarQuiverNode> Children = new List<BStarQuiverNode>();
+
+        public void UpdateBounds(in AffinePoint11 point)
+        {
+            if (!HasBounds)
+            {
+                MinBound = point;
+                MaxBound = point;
+                HasBounds = true;
+                return;
+            }
+
+            MinBound = AffinePoint11.ComponentwiseMin(MinBound, point);
+            MaxBound = AffinePoint11.ComponentwiseMax(MaxBound, point);
+        }
 
         /// <summary>
         /// Evaluates whether this node's bounding region is disjoint from the query range.
@@ -94,6 +391,9 @@ namespace AffineSpace.Optimization
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public bool MatchAndPrune(in AffinePoint11 qMin, in AffinePoint11 qMax)
         {
+            if (!HasBounds)
+                return false;
+
             // A node is prunable if, in any dimension, the query range lies entirely
             // above MaxBound or entirely below MinBound.
             bool outOfLow  = Vector.GreaterThanAny(qMin.Low,  MaxBound.Low)  ||
@@ -161,7 +461,34 @@ namespace AffineSpace.Optimization
                 throw new InvalidOperationException(
                     $"MongoDB に接続できませんでした ({connectionString})。サーバーが起動しているか確認してください。", ex);
             }
+
             _root = new BStarQuiverNode();
+            EnsureRouteBuckets();
+        }
+
+        private void EnsureRouteBuckets()
+        {
+            if (_root.Children.Count != 0)
+                return;
+
+            BStarQuiverNode first = null;
+            BStarQuiverNode previous = null;
+
+            foreach (var band in QuiverRouteTheory.Bands)
+            {
+                var child = new BStarQuiverNode(band);
+                if (first == null)
+                    first = child;
+
+                if (previous != null)
+                    previous.Sibling = child;
+
+                _root.Children.Add(child);
+                previous = child;
+            }
+
+            if (previous != null)
+                previous.Sibling = first;
         }
 
         // ── Index management ─────────────────────────────────────────────────
@@ -226,8 +553,13 @@ namespace AffineSpace.Optimization
 
             _collection.InsertOne(doc);
 
-            // Register in the B*-Tree (simplified; full rebalancing omitted for brevity)
-            _root.Entries.Add(point);
+            // Register in the B*-Tree using the finite Golay route as a routing alphabet.
+            var band = QuiverRouteTheory.Classify(point);
+            var bucket = _root.Children[QuiverRouteTheory.Rank(band)];
+
+            bucket.Entries.Add(point);
+            bucket.UpdateBounds(point);
+            _root.UpdateBounds(point);
         }
 
         // ── Read path ─────────────────────────────────────────────────────────
@@ -242,32 +574,46 @@ namespace AffineSpace.Optimization
         public List<AffineDocument> Search(AffinePoint11 qMin, AffinePoint11 qMax)
         {
             var results = new List<AffineDocument>();
-            Traverse(_root, qMin, qMax, results);
-            return results;
-        }
+            var seenIds = new HashSet<ObjectId>();
+            var frontier = new PriorityQueue<TraversalFrame, float>();
+            var initialState = SearchRouteState.FromQuery(qMin, qMax);
 
-        private void Traverse(
-            BStarQuiverNode      node,
-            in AffinePoint11     qMin,
-            in AffinePoint11     qMax,
-            List<AffineDocument> results)
-        {
-            if (node == null) return;
+            frontier.Enqueue(new TraversalFrame(_root, initialState), 0f);
 
-            // Pruning: if the quiver morphism maps to the empty set, skip this sub-tree entirely.
-            if (node.MatchAndPrune(qMin, qMax)) return;
-
-            if (node.Children.Count == 0)
+            while (frontier.Count > 0)
             {
-                // Leaf node: issue a targeted MongoDB range query bounded by the Morton interval.
-                var docs = ExecuteMongoQuery(node, qMin, qMax);
-                results.AddRange(docs);
-            }
-            else
-            {
+                var frame = frontier.Dequeue();
+                var node = frame.Node;
+
+                if (node == null || node.MatchAndPrune(qMin, qMax))
+                    continue;
+
+                if (node.Children.Count == 0)
+                {
+                    var docs = ExecuteMongoQuery(node, qMin, qMax);
+                    foreach (var doc in docs)
+                    {
+                        if (seenIds.Add(doc.Id))
+                            results.Add(doc);
+                    }
+
+                    continue;
+                }
+
                 foreach (var child in node.Children)
-                    Traverse(child, qMin, qMax, results);
+                {
+                    if (!child.HasBounds)
+                        continue;
+
+                    if (!frame.Route.CanAdvance(child))
+                        continue;
+
+                    var nextRoute = frame.Route.Advance(child);
+                    frontier.Enqueue(new TraversalFrame(child, nextRoute), nextRoute.GetPriority(child));
+                }
             }
+
+            return results;
         }
 
         // ── MongoDB query ─────────────────────────────────────────────────────
@@ -281,15 +627,37 @@ namespace AffineSpace.Optimization
             in AffinePoint11 qMin,
             in AffinePoint11 qMax)
         {
-            long mortonMin = GenerateMorton11(qMin);
-            long mortonMax = GenerateMorton11(qMax);
+            var searchMin = AffinePoint11.ComponentwiseMax(node.MinBound, qMin);
+            var searchMax = AffinePoint11.ComponentwiseMin(node.MaxBound, qMax);
+
+            if (QuiverRouteTheory.IsInvalidInterval(searchMin, searchMax))
+                return new List<AffineDocument>();
+
+            long mortonMin = GenerateMorton11(searchMin);
+            long mortonMax = GenerateMorton11(searchMax);
 
             var filter = Builders<AffineDocument>.Filter.And(
                 Builders<AffineDocument>.Filter.Gte(d => d.MortonCode, mortonMin),
                 Builders<AffineDocument>.Filter.Lte(d => d.MortonCode, mortonMax)
             );
 
-            return _collection.Find(filter).ToList();
+            var documents = _collection.Find(filter).ToList();
+            return documents.FindAll(document => CoordinatesWithinRange(document.Coords, searchMin, searchMax));
+        }
+
+        private static bool CoordinatesWithinRange(float[] coords, in AffinePoint11 qMin, in AffinePoint11 qMax)
+        {
+            if (coords == null || coords.Length < 11)
+                return false;
+
+            for (int dimension = 0; dimension < 11; dimension++)
+            {
+                float value = coords[dimension];
+                if (value < qMin.GetCoordinate(dimension) || value > qMax.GetCoordinate(dimension))
+                    return false;
+            }
+
+            return true;
         }
 
         public void Dispose() { /* MongoClient is thread-safe and connection-pooled; no explicit teardown required. */ }
@@ -323,8 +691,21 @@ namespace AffineSpace.Optimization
             var hits = engine.Search(qMin, qMax);
 
             Console.WriteLine($"Documents found: {hits.Count}");
+            Console.WriteLine($"Route window: {QuiverRouteTheory.Classify(qMin)} -> {QuiverRouteTheory.Classify(qMax)}");
             foreach (var doc in hits)
-                Console.WriteLine($"  id={doc.Id}  morton={doc.MortonCode}");
+                Console.WriteLine($"  id={doc.Id}  morton={doc.MortonCode}  coords=[{FormatCoords(doc.Coords)}]");
+        }
+
+        private static string FormatCoords(float[] coords)
+        {
+            if (coords == null)
+                return string.Empty;
+
+            var parts = new string[Math.Min(coords.Length, 11)];
+            for (int index = 0; index < parts.Length; index++)
+                parts[index] = coords[index].ToString("0.##", CultureInfo.InvariantCulture);
+
+            return string.Join(", ", parts);
         }
     }
 }
